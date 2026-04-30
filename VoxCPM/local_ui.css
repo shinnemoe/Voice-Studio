@@ -1,0 +1,51 @@
+:root {
+  --app-bg: linear-gradient(180deg, #f5f7f1 0%, #ecf1e5 100%);
+  --surface: rgba(255, 255, 255, 0.8);
+  --surface-border: rgba(66, 84, 61, 0.12);
+  --text-main: #122013;
+  --text-muted: #516052;
+  --accent: #2b6a45;
+  --accent-strong: #19452c;
+}
+
+.gradio-container {
+  background: var(--app-bg);
+}
+
+.gradio-container .main {
+  max-width: 1120px;
+}
+
+.gradio-container h1,
+.gradio-container p,
+.gradio-container label {
+  color: var(--text-main);
+}
+
+.gradio-container .block,
+.gradio-container .gr-group,
+.gradio-container .gr-form,
+.gradio-container .gr-box {
+  border: 1px solid var(--surface-border);
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  border-radius: 20px;
+}
+
+.gradio-container .gr-button-primary {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  border: none;
+}
+
+.gradio-container .gr-button-primary:hover {
+  filter: brightness(1.03);
+}
+
+.gradio-container .gr-textbox textarea,
+.gradio-container .gr-textbox input {
+  color: var(--text-main);
+}
+
+.gradio-container .gradio-markdown p {
+  color: var(--text-muted);
+}

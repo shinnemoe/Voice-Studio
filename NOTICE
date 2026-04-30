@@ -1,0 +1,13 @@
+Voice Studio includes and builds on source code from the VoxCPM project.
+
+Upstream project:
+- OpenBMB / VoxCPM
+- Repository: https://github.com/OpenBMB/VoxCPM
+- License: Apache License 2.0
+
+This repository also contains local application code for:
+- an Electron desktop interface
+- a FastAPI backend bridge
+- local workflow changes for voice cloning and optional narration rewriting
+
+Please review upstream notices and licenses for third-party dependencies before redistribution.

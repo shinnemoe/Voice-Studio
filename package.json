@@ -1,0 +1,39 @@
+{
+  "name": "voice-studio",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Desktop voice cloning studio powered by VoxCPM and Electron",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack:mac": "electron-builder --mac dir",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.lapyae.voicestudio",
+    "productName": "Voice Studio",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "backend/**/*",
+      "VoxCPM/src/**/*",
+      "VoxCPM/pretrained_models/**/*",
+      "VoxCPM/.venv/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        "dir",
+        "zip"
+      ],
+      "category": "public.app-category.music"
+    }
+  }
+}

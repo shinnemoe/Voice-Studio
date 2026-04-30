@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Voice Cloner</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="titlebar">
+        <div class="titlebar-drag">
+          <div class="titlebar-copy">
+            <p class="eyebrow">Local Voice Cloner</p>
+            <h1>Voice Studio</h1>
+          </div>
+          <div class="titlebar-status">
+            <span>Backend: <strong id="backend-status">Starting...</strong></span>
+            <span>Rewrite: <strong id="rewrite-status">Off</strong></span>
+          </div>
+        </div>
+      </header>
+
+      <nav class="tab-bar" aria-label="Workspace tabs">
+        <button id="tab-studio" class="tab-button active" type="button" data-tab="studio">Studio</button>
+        <button id="tab-history" class="tab-button" type="button" data-tab="history">History</button>
+        <button id="tab-setup" class="tab-button" type="button" data-tab="setup">Setup</button>
+      </nav>
+
+      <section id="panel-studio" class="tab-panel active">
+        <div id="studio-main-panel" class="panel main-panel">
+          <div class="panel-header">
+            <h2>Target Text</h2>
+            <div class="header-actions">
+              <button id="generate-button" class="primary-button compact-button" type="button">Generate</button>
+            </div>
+          </div>
+
+          <form id="clone-form" class="form-grid studio-grid">
+            <label class="field field-wide">
+              <span>Target text</span>
+              <textarea id="target-text" name="targetText" rows="6" placeholder="Paste the post or text you want to narrate"></textarea>
+            </label>
+
+            <label class="field field-wide">
+              <span>Prepared script</span>
+              <textarea id="prepared-script" class="prepared-script" rows="10" placeholder="Gemini rewrite preview will appear here. You can edit it before generating audio."></textarea>
+            </label>
+
+            <p id="approval-status" class="approval-status">Paste text to generate a preview, then edit it if needed and click Generate.</p>
+          </form>
+        </div>
+
+        <div id="studio-result-layout" class="result-layout">
+          <div class="panel result-card output-card">
+            <div class="panel-header">
+              <h2>Generated Audio</h2>
+              <button id="open-output" class="secondary-button compact-button" type="button" disabled>Open Output Folder</button>
+            </div>
+            <div class="audio-card-shell">
+              <audio id="output-audio" controls></audio>
+              <p id="output-path" class="output-path">No output yet.</p>
+            </div>
+          </div>
+
+          <div class="panel result-card log-card">
+            <div class="panel-header">
+              <h2>Run Log</h2>
+              <button id="clear-log" class="secondary-button compact-button" type="button">Clear Log</button>
+            </div>
+            <div class="log-shell">
+              <pre id="run-log" class="log-box">Waiting for backend...</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-history" class="tab-panel">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>History</h2>
+            <button id="refresh-history" class="secondary-button compact-button" type="button">Refresh History</button>
+          </div>
+
+          <div class="history-layout">
+            <div id="history-list" class="history-list">
+              <p class="history-empty">No generated audio yet.</p>
+            </div>
+
+            <div class="history-player-card">
+              <h3 id="history-current-title">Select audio from history</h3>
+              <audio id="history-audio" controls></audio>
+              <p id="history-current-meta" class="history-meta">Generated files will appear here.</p>
+              <button id="open-history-folder" class="secondary-button compact-button" type="button">Open Output Folder</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-setup" class="tab-panel">
+        <div class="setup-layout">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Voice Setup</h2>
+              <button id="pick-audio" class="secondary-button compact-button" type="button">Choose Audio</button>
+            </div>
+
+            <div class="form-grid">
+              <label class="field field-wide">
+                <span>Reference audio path</span>
+                <input id="reference-audio" name="referenceAudio" type="text" readonly placeholder="Choose a voice sample file" />
+              </label>
+
+              <label class="field remember-field">
+                <span>Locked reference</span>
+                <label class="toggle-row">
+                  <input id="lock-reference" type="checkbox" />
+                  <span>Keep source audio + transcript until I unlock</span>
+                </label>
+              </label>
+
+              <label class="field field-wide">
+                <span>Reference transcript</span>
+                <textarea id="prompt-text" name="promptText" rows="4" placeholder="Paste the exact transcript from the reference audio for higher similarity"></textarea>
+              </label>
+
+              <label class="field">
+                <span>Delivery preset</span>
+                <select id="style-preset" name="stylePreset">
+                  <option selected>Natural</option>
+                  <option>Deep Reflective</option>
+                  <option>Warm Storyteller</option>
+                  <option>Soft Intimate</option>
+                  <option>Documentary</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>Target pace (WPM)</span>
+                <input id="target-wpm" type="number" min="70" max="170" step="5" value="105" />
+              </label>
+
+              <label class="field field-wide">
+                <span>Style guidance</span>
+                <textarea id="style-text" name="styleText" rows="3" placeholder="Example: deep, reflective, very slow, thoughtful pauses, calm excitement"></textarea>
+              </label>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>App Settings</h2>
+            </div>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>Quality preset</span>
+                <select id="quality" name="quality">
+                  <option>Fast</option>
+                  <option selected>Balanced</option>
+                  <option>High Similarity</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>Device</span>
+                <select id="device" name="device">
+                  <option selected>auto</option>
+                  <option>cpu</option>
+                  <option>mps</option>
+                  <option>cuda</option>
+                </select>
+              </label>
+
+              <label class="field field-wide">
+                <span>Model source</span>
+                <input id="model-source" name="modelSource" type="text" value="/Users/lapyae/Development/Voice Cloner Local/VoxCPM/pretrained_models/VoxCPM2" />
+              </label>
+
+              <label class="field field-wide">
+                <span>Gemini API key</span>
+                <input id="gemini-api-key" type="password" placeholder="Paste Gemini API key" />
+              </label>
+
+              <label class="field">
+                <span>Gemini model</span>
+                <input id="gemini-model" type="text" value="gemini-2.5-flash" />
+              </label>
+
+              <label class="field remember-field">
+                <span>Rewrite posts with Gemini</span>
+                <label class="toggle-row">
+                  <input id="rewrite-with-ai" type="checkbox" />
+                  <span>Auto rewrite pasted posts into narration preview</span>
+                </label>
+              </label>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>
