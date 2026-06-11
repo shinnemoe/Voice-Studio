@@ -18,6 +18,8 @@ COPY . .
 
 RUN pip install --no-cache-dir torchaudio --index-url https://download.pytorch.org/whl/cu121
 
+RUN pip install --no-cache-dir "setuptools>=64" "setuptools_scm>=8" wheel
+
 RUN pip install --no-cache-dir -e VoxCPM --no-deps
 
 RUN pip install --no-cache-dir \
