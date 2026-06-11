@@ -1,4 +1,3 @@
-# Voice Studio — Cloud GPU Dockerfile
 FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -18,20 +17,14 @@ COPY . .
 
 RUN pip install --no-cache-dir torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-RUN pip install --no-cache-dir "setuptools>=64" "setuptools_scm>=8" wheel
-
-RUN pip install --no-cache-dir -e VoxCPM --no-deps
+RUN pip install --no-cache-dir voxcpm
 
 RUN pip install --no-cache-dir \
     "fastapi>=0.104.0" \
     "uvicorn[standard]>=0.24.0" \
     python-multipart \
     soundfile \
-    numpy \
-    requests \
-    "transformers>=4.36.2" \
-    einops \
-    torchcodec
+    requests
 
 EXPOSE 8000
 
