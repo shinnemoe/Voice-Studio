@@ -4,27 +4,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    libsndfile1 \
-    git \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ffmpeg libsndfile1 git build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-
 COPY . .
 
 RUN pip install --no-cache-dir torchaudio --index-url https://download.pytorch.org/whl/cu121
-
 RUN pip install --no-cache-dir voxcpm
-
-RUN pip install --no-cache-dir \
-    "fastapi>=0.104.0" \
-    "uvicorn[standard]>=0.24.0" \
-    python-multipart \
-    soundfile \
-    requests
+RUN pip install --no-cache-dir "fastapi>=0.104.0" "uvicorn[standard]>=0.24.0" python-multipart soundfile numpy requests
 
 EXPOSE 8000
 
