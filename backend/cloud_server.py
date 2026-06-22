@@ -46,6 +46,14 @@ STYLE_PRESETS = {
     "Documentary": "documentary narration delivery, deep, composed, serious tone",
 }
 
+# Speed → min_len multiplier (text_tokens * factor).
+# Higher min_len forces the model to generate more audio tokens → slower natural speech.
+SPEED_PRESETS: dict[str, float | None] = {
+    "Normal":  None,   # default min_len=2, model decides freely
+    "Slower":  0.8,    # ~20% more audio tokens than text tokens
+    "Slowest": 1.3,    # ~60% more audio tokens than text tokens
+}
+
 _model = None
 _status = "starting"
 _status_detail = ""
@@ -134,6 +142,7 @@ async def generate_cloned_voice(
     quality: str = Form("Balanced"),
     style: str = Form("Natural"),
     custom_style: str = Form(""),
+    speed: str = Form("Normal"),
 ):
     if _status != "ready":
         raise HTTPException(status_code=503, detail=f"Model not ready. Status: {_status}")
@@ -141,7 +150,14 @@ async def generate_cloned_voice(
         raise HTTPException(status_code=400, detail="Text is required")
 
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
-    quality_params = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"])
+    quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
+
+    # Speed → min_len: higher min_len forces the model to generate more
+    # audio tokens, naturally slowing down speech (not a post-process stretch).
+    speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
+    if speed_mult is not None and _model is not None:
+        text_tokens = len(_model.text_tokenizer(text.strip()))
+        quality_params["min_len"] = max(2, int(text_tokens * speed_mult))
 
     suffix = Path(reference_audio.filename or "ref.wav").suffix or ".wav"
     ref_tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -180,14 +196,25 @@ async def generate_cloned_voice(
             Path(f).unlink(missing_ok=True)
 
 @app.post("/tts")
-async def text_to_speech(text: str = Form(...), quality: str = Form("Balanced"), style: str = Form("Natural"), custom_style: str = Form("")):
+async def text_to_speech(
+    text: str = Form(...),
+    quality: str = Form("Balanced"),
+    style: str = Form("Natural"),
+    custom_style: str = Form(""),
+    speed: str = Form("Normal"),
+):
     if _status != "ready":
         raise HTTPException(status_code=503, detail=f"Model not ready. Status: {_status}")
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
-    quality_params = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"])
+    quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
+
+    speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
+    if speed_mult is not None and _model is not None:
+        text_tokens = len(_model.text_tokenizer(text.strip()))
+        quality_params["min_len"] = max(2, int(text_tokens * speed_mult))
     try:
         wav = _model.generate(text=formatted_text, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
