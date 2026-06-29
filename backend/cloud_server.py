@@ -211,15 +211,9 @@ async def generate_cloned_voice(
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
-    # Speed → min_len: higher min_len forces the model to generate more
-    # audio tokens, naturally slowing down speech (not a post-process stretch).
-    # Capped at 15 to prevent generation crashes on short text.
-    speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
-    if speed_mult is not None and _model is not None:
-        text_tokens = len(_model.text_tokenizer(text.strip()))
-        quality_params["min_len"] = min(15, max(2, int(text_tokens * speed_mult)))
-
-    # Speed → text instruction: prepend pacing guidance for dual-path control
+    # Speed → text instruction: VoxCPM2 interprets this naturally.
+    # min_len was removed — it's a minimum-gate, not a speed control,
+    # and it conflicts with the model's badcase retry logic.
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
@@ -240,7 +234,7 @@ async def generate_cloned_voice(
         all_wavs = []
         for chunk in chunks:
             formatted = f"({style_desc}){chunk}" if style_desc else chunk
-            wav = _model.generate(text=formatted, reference_wav_path=ref_path, **quality_params)
+            wav = _model.generate(text=formatted, reference_wav_path=ref_path, retry_badcase=False, **quality_params)
             all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
@@ -275,19 +269,14 @@ async def text_to_speech(
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
-    speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
-    if speed_mult is not None and _model is not None:
-        text_tokens = len(_model.text_tokenizer(text.strip()))
-        quality_params["min_len"] = max(2, int(text_tokens * speed_mult))
-
-    # Speed → text instruction: prepend pacing guidance for dual-path control
+    # Speed → text instruction: VoxCPM2 interprets this naturally
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
 
     formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
     try:
-        wav = _model.generate(text=formatted_text, **quality_params)
+        wav = _model.generate(text=formatted_text, retry_badcase=False, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_path = OUTPUT_DIR / f"tts-{timestamp}.wav"
         sf.write(str(out_path), wav, _model.tts_model.sample_rate)
