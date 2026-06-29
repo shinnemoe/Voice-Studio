@@ -2,13 +2,15 @@
 cloud_server.py — Voice Studio Cloud API for RunPod GPU deployment.
 
 Endpoints:
-  GET  /health      — check if model is loaded and ready (poll this!)
-  POST /generate    — voice cloning (text + reference audio → WAV)
-  POST /tts         — pure TTS without reference audio
+  GET  /health         — check if model is loaded and ready (poll this!)
+  POST /generate       — voice cloning (returns job_id immediately)
+  GET  /status/{job_id} — check generation progress
+  GET  /result/{job_id} — download finished audio
+  POST /tts            — pure TTS without reference audio
 """
 from __future__ import annotations
 
-import os, re, sys, threading, tempfile, warnings
+import os, re, sys, threading, tempfile, time, uuid, warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -46,16 +48,6 @@ STYLE_PRESETS = {
     "Documentary": "documentary narration delivery, deep, composed, serious tone",
 }
 
-# Speed → min_len multiplier (text_tokens * factor).
-# Higher min_len forces the model to generate more audio tokens → slower natural speech.
-SPEED_PRESETS: dict[str, float | None] = {
-    "Normal":  None,   # default min_len=2, model decides freely
-    "Slower":  0.8,    # ~20% more audio tokens than text tokens
-    "Slowest": 1.3,    # ~60% more audio tokens than text tokens
-}
-
-# Speed → additional text instruction prepended to style description.
-# Works alongside min_len for dual-path slowdown (text instruction + model param).
 SPEED_INSTRUCTIONS: dict[str, str] = {
     "Normal":  "",
     "Slower":  "speak slowly, calm and clear pacing",
@@ -69,6 +61,27 @@ _status_detail = ""
 MAX_REF_DURATION = 10.0
 SILENCE_GAP = 0.5
 
+# ─── In-memory job store ──────────────────────────────────────────────────
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+# Clean up old jobs after 10 minutes
+_JOB_TTL = 600
+
+
+def _cleanup_expired_jobs():
+    """Remove jobs older than JOB_TTL."""
+    now = time.time()
+    with _jobs_lock:
+        expired = [jid for jid, j in _jobs.items() if now - j.get("created_at", 0) > _JOB_TTL]
+        for jid in expired:
+            # Delete result file if it exists
+            path = _jobs[jid].get("result_path", "")
+            if path:
+                Path(path).unlink(missing_ok=True)
+            del _jobs[jid]
+
+
 def _trim_audio(path, max_duration=MAX_REF_DURATION):
     info = sf.info(path)
     if info.duration <= max_duration:
@@ -80,19 +93,9 @@ def _trim_audio(path, max_duration=MAX_REF_DURATION):
     tmp.close()
     return tmp.name
 
+
 def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
-    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars.
-
-    Burmese uses ။ (section end) and ၊ (clause separator) as natural boundaries.
-    English-like punctuation (., !, ?) and newlines are also respected.
-
-    Strategy:
-    1. Split on Burmese section end ။ — each gets its own chunk
-    2. For chunks still over max_chars, split on Burmese clause separator ၊
-    3. For chunks still over max_chars, split on English sentence boundaries
-    4. For chunks still over max_chars, split on commas
-    5. Final fallback: mid-sentence split at max_chars
-    """
+    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars."""
     def _split_and_merge(parts: list[str], delimiter: str, max_len: int) -> list[str]:
         result = []
         buf = ""
@@ -103,21 +106,18 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
             else:
                 if buf:
                     result.append(buf)
-                # If a single element exceeds max_len, try next delimiter
                 if len(part) > max_len:
-                    result.append(part)  # pass through for deeper splitting
+                    result.append(part)
                 else:
                     buf = part
         if buf:
             result.append(buf)
         return result
 
-    # Step 1: Split on Burmese section end ။ + any sentence-ending punctuation
     step1 = re.split(r"(?<=[။.!?])\s*", text)
     step1 = [s.strip() for s in step1 if s.strip()]
     chunks = _split_and_merge(step1, " ", max_chars)
 
-    # Step 2: For chunks still over limit, split on Burmese clause separator ၊
     final = []
     for chunk in chunks:
         if len(chunk) <= max_chars:
@@ -128,7 +128,6 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
             sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
             final.extend(sub_chunks)
 
-    # Step 3: For any remaining oversized chunks, split on commas
     final2 = []
     for chunk in final:
         if len(chunk) <= max_chars:
@@ -139,7 +138,6 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
             sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
             final2.extend(sub_chunks)
 
-    # Step 4: Final fallback — hard split for any stubbornly long chunks
     final3 = []
     for chunk in final2:
         if len(chunk) <= max_chars:
@@ -149,6 +147,7 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
                 final3.append(chunk[i:i + max_chars].strip())
 
     return [c for c in final3 if c]
+
 
 def _bootstrap_model():
     global _model, _status, _status_detail
@@ -182,17 +181,77 @@ def _bootstrap_model():
         _status_detail = f"Model load failed: {e}"
         print(f"[Voice Studio] {_status_detail}")
 
-app = FastAPI(title="Voice Studio Cloud API", version="2.1.0")
+
+def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
+                    quality_params: dict, temp_files: list[str]):
+    """Background generation worker — runs in a daemon thread."""
+    try:
+        sample_rate = None
+        all_wavs = []
+        for i, chunk in enumerate(chunks):
+            # Only prepend style instruction to FIRST chunk.
+            # Subsequent chunks continue naturally without re-instructing,
+            # which prevents garbled/nonsense audio from repeated instructions.
+            if i == 0 and style_desc:
+                formatted = f"({style_desc}){chunk}"
+            else:
+                formatted = chunk
+
+            wav = _model.generate(
+                text=formatted,
+                reference_wav_path=ref_path,
+                retry_badcase=False,
+                **quality_params,
+            )
+            all_wavs.append(wav)
+            if sample_rate is None:
+                sample_rate = _model.tts_model.sample_rate
+
+            import torch
+            torch.cuda.empty_cache()
+
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["progress"] = {"done": i + 1, "total": len(chunks)}
+
+        # Concatenate all chunks with silence gaps
+        silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
+        combined = all_wavs[0]
+        for wav in all_wavs[1:]:
+            combined = np.concatenate([combined, silence, wav])
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = OUTPUT_DIR / f"clone-{timestamp}.wav"
+        sf.write(str(out_path), combined, sample_rate)
+
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["result_path"] = str(out_path)
+    except Exception as e:
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"] = str(e)
+    finally:
+        for f in temp_files:
+            Path(f).unlink(missing_ok=True)
+
+
+app = FastAPI(title="Voice Studio Cloud API", version="2.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 @app.on_event("startup")
 async def startup_event():
     threading.Thread(target=_bootstrap_model, daemon=True).start()
     print("[Voice Studio] Server started. Poll /health for model status.")
 
+
 @app.get("/health")
 async def health_check():
     return {"status": _status, "detail": _status_detail, "ready": _status == "ready"}
+
 
 @app.post("/generate")
 async def generate_cloned_voice(
@@ -211,9 +270,7 @@ async def generate_cloned_voice(
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
-    # Speed → text instruction: VoxCPM2 interprets this naturally.
-    # min_len was removed — it's a minimum-gate, not a speed control,
-    # and it conflicts with the model's badcase retry logic.
+    # Speed text instruction — will be prepended to first chunk only
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
@@ -230,32 +287,78 @@ async def generate_cloned_voice(
         if not chunks:
             chunks = [text.strip()]
 
-        sample_rate = None
-        all_wavs = []
-        for chunk in chunks:
-            formatted = f"({style_desc}){chunk}" if style_desc else chunk
-            wav = _model.generate(text=formatted, reference_wav_path=ref_path, retry_badcase=False, **quality_params)
-            all_wavs.append(wav)
-            if sample_rate is None:
-                sample_rate = _model.tts_model.sample_rate
-            # Free GPU memory between chunks to prevent OOM crashes
-            import torch
-            torch.cuda.empty_cache()
+        # Create job and start background generation
+        _cleanup_expired_jobs()
+        job_id = str(uuid.uuid4())[:8]
+        job = {
+            "id": job_id,
+            "status": "processing",
+            "progress": {"done": 0, "total": len(chunks)},
+            "error": None,
+            "result_path": None,
+            "created_at": time.time(),
+        }
+        with _jobs_lock:
+            _jobs[job_id] = job
 
-        silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
-        combined = all_wavs[0]
-        for wav in all_wavs[1:]:
-            combined = np.concatenate([combined, silence, wav])
+        threading.Thread(
+            target=_run_generation,
+            args=(job_id, chunks, ref_path, style_desc, quality_params, temp_files),
+            daemon=True,
+        ).start()
 
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = OUTPUT_DIR / f"clone-{timestamp}.wav"
-        sf.write(str(out_path), combined, sample_rate)
-        return FileResponse(path=str(out_path), media_type="audio/wav", filename=f"voice-clone-{timestamp}.wav")
+        return {"job_id": job_id, "status": "processing", "progress": job["progress"]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
-    finally:
         for f in temp_files:
             Path(f).unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Generation setup failed: {str(e)}")
+
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    _cleanup_expired_jobs()
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "error": job.get("error"),
+    }
+
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str):
+    _cleanup_expired_jobs()
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    if job["status"] == "processing":
+        return {
+            "job_id": job["id"],
+            "status": "processing",
+            "progress": job["progress"],
+        }
+    if job["status"] == "error":
+        return {"status": "error", "error": job.get("error", "Unknown error")}
+
+    result_path = job.get("result_path", "")
+    if not result_path or not Path(result_path).exists():
+        raise HTTPException(status_code=500, detail="Result file not found")
+
+    # Remove job after serving result
+    with _jobs_lock:
+        _jobs.pop(job_id, None)
+
+    return FileResponse(
+        path=result_path,
+        media_type="audio/wav",
+        filename=f"voice-clone-{job_id}.wav",
+    )
+
 
 @app.post("/tts")
 async def text_to_speech(
@@ -272,7 +375,6 @@ async def text_to_speech(
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
-    # Speed → text instruction: VoxCPM2 interprets this naturally
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
@@ -286,6 +388,7 @@ async def text_to_speech(
         return FileResponse(path=str(out_path), media_type="audio/wav", filename=f"tts-{timestamp}.wav")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
