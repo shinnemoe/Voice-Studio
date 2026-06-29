@@ -238,6 +238,9 @@ async def generate_cloned_voice(
             all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
+            # Free GPU memory between chunks to prevent OOM crashes
+            import torch
+            torch.cuda.empty_cache()
 
         silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
         combined = all_wavs[0]
