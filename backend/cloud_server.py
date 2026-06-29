@@ -54,6 +54,14 @@ SPEED_PRESETS: dict[str, float | None] = {
     "Slowest": 1.3,    # ~60% more audio tokens than text tokens
 }
 
+# Speed → additional text instruction prepended to style description.
+# Works alongside min_len for dual-path slowdown (text instruction + model param).
+SPEED_INSTRUCTIONS: dict[str, str] = {
+    "Normal":  "",
+    "Slower":  "speak slowly, calm and clear pacing",
+    "Slowest": "speak very slowly, calm and clear pacing",
+}
+
 _model = None
 _status = "starting"
 _status_detail = ""
@@ -72,24 +80,75 @@ def _trim_audio(path, max_duration=MAX_REF_DURATION):
     tmp.close()
     return tmp.name
 
-def _split_paragraphs(text, max_chars=300):
-    raw = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
-    chunks = []
-    for para in raw:
-        if len(para) <= max_chars:
-            chunks.append(para)
-        else:
-            sentences = re.split(r"(?<=[။.!?])\s+", para)
-            buf = ""
-            for s in sentences:
-                if len(buf) + len(s) > max_chars and buf:
-                    chunks.append(buf.strip())
-                    buf = s
+def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
+    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars.
+
+    Burmese uses ။ (section end) and ၊ (clause separator) as natural boundaries.
+    English-like punctuation (., !, ?) and newlines are also respected.
+
+    Strategy:
+    1. Split on Burmese section end ။ — each gets its own chunk
+    2. For chunks still over max_chars, split on Burmese clause separator ၊
+    3. For chunks still over max_chars, split on English sentence boundaries
+    4. For chunks still over max_chars, split on commas
+    5. Final fallback: mid-sentence split at max_chars
+    """
+    def _split_and_merge(parts: list[str], delimiter: str, max_len: int) -> list[str]:
+        result = []
+        buf = ""
+        for part in parts:
+            candidate = (buf + delimiter + part).strip() if buf else part
+            if len(candidate) <= max_len:
+                buf = candidate
+            else:
+                if buf:
+                    result.append(buf)
+                # If a single element exceeds max_len, try next delimiter
+                if len(part) > max_len:
+                    result.append(part)  # pass through for deeper splitting
                 else:
-                    buf = (buf + " " + s).strip()
-            if buf:
-                chunks.append(buf)
-    return chunks
+                    buf = part
+        if buf:
+            result.append(buf)
+        return result
+
+    # Step 1: Split on Burmese section end ။ + any sentence-ending punctuation
+    step1 = re.split(r"(?<=[။.!?])\s*", text)
+    step1 = [s.strip() for s in step1 if s.strip()]
+    chunks = _split_and_merge(step1, " ", max_chars)
+
+    # Step 2: For chunks still over limit, split on Burmese clause separator ၊
+    final = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
+        else:
+            sub_parts = re.split(r"(?<=[၊])\s*", chunk)
+            sub_parts = [s.strip() for s in sub_parts if s.strip()]
+            sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
+            final.extend(sub_chunks)
+
+    # Step 3: For any remaining oversized chunks, split on commas
+    final2 = []
+    for chunk in final:
+        if len(chunk) <= max_chars:
+            final2.append(chunk)
+        else:
+            sub_parts = re.split(r"(?<=[,])\s*", chunk)
+            sub_parts = [s.strip() for s in sub_parts if s.strip()]
+            sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
+            final2.extend(sub_chunks)
+
+    # Step 4: Final fallback — hard split for any stubbornly long chunks
+    final3 = []
+    for chunk in final2:
+        if len(chunk) <= max_chars:
+            final3.append(chunk)
+        else:
+            for i in range(0, len(chunk), max_chars):
+                final3.append(chunk[i:i + max_chars].strip())
+
+    return [c for c in final3 if c]
 
 def _bootstrap_model():
     global _model, _status, _status_detail
@@ -154,10 +213,16 @@ async def generate_cloned_voice(
 
     # Speed → min_len: higher min_len forces the model to generate more
     # audio tokens, naturally slowing down speech (not a post-process stretch).
+    # Capped at 15 to prevent generation crashes on short text.
     speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
     if speed_mult is not None and _model is not None:
         text_tokens = len(_model.text_tokenizer(text.strip()))
-        quality_params["min_len"] = max(2, int(text_tokens * speed_mult))
+        quality_params["min_len"] = min(15, max(2, int(text_tokens * speed_mult)))
+
+    # Speed → text instruction: prepend pacing guidance for dual-path control
+    speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
+    if speed_instruction:
+        style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
 
     suffix = Path(reference_audio.filename or "ref.wav").suffix or ".wav"
     ref_tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -167,7 +232,7 @@ async def generate_cloned_voice(
         ref_tmp.close()
         ref_path = _trim_audio(ref_tmp.name)
 
-        chunks = _split_paragraphs(text.strip())
+        chunks = _split_sentences(text.strip())
         if not chunks:
             chunks = [text.strip()]
 
@@ -208,13 +273,19 @@ async def text_to_speech(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
-    formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
     speed_mult = SPEED_PRESETS.get(speed, SPEED_PRESETS["Normal"])
     if speed_mult is not None and _model is not None:
         text_tokens = len(_model.text_tokenizer(text.strip()))
         quality_params["min_len"] = max(2, int(text_tokens * speed_mult))
+
+    # Speed → text instruction: prepend pacing guidance for dual-path control
+    speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
+    if speed_instruction:
+        style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
+
+    formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
     try:
         wav = _model.generate(text=formatted_text, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
