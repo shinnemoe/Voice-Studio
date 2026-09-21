@@ -66,7 +66,7 @@ _status = "starting"
 _status_detail = ""
 
 MAX_REF_DURATION = 10.0
-SILENCE_GAP = 0.5
+SILENCE_GAP = 0.3
 
 # ─── In-memory job store ──────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
