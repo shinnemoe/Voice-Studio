@@ -10,7 +10,7 @@ Endpoints:
 """
 from __future__ import annotations
 
-import os, re, sys, threading, tempfile, time, uuid, warnings
+import os, re, sys, threading, tempfile, time, uuid, warnings, shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +33,13 @@ warnings.filterwarnings("ignore")
 MODEL_PATH = os.environ.get("MODEL_PATH", str(VOXCPM_DIR / "pretrained_models" / "VoxCPM2"))
 OUTPUT_DIR = Path("/tmp/voice-studio-outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── VPS-side combining feature flag ─────────────────────────────────────
+# When True: chunks saved individually, VPS combines them (GPU freed sooner).
+# When False (default): old behaviour — RunPod combines everything.
+COMBINE_ON_VPS = os.environ.get("COMBINE_ON_VPS", "false").lower() == "true"
+CHUNK_DIR = Path("/tmp/voice-studio-chunks")
+CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
 QUALITY_PRESETS = {
     "Fast": {"inference_timesteps": 6, "cfg_value": 1.8},
@@ -182,12 +189,31 @@ def _bootstrap_model():
         print(f"[Voice Studio] {_status_detail}")
 
 
+def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
+    """Combine wav chunks on RunPod (fallback or default path)."""
+    silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
+    combined = all_wavs[0]
+    for wav in all_wavs[1:]:
+        combined = np.concatenate([combined, silence, wav])
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = OUTPUT_DIR / f"clone-{timestamp}.wav"
+    sf.write(str(out_path), combined, sample_rate)
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["result_path"] = str(out_path)
+
+
 def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
                     quality_params: dict, temp_files: list[str]):
     """Background generation worker — runs in a daemon thread."""
     try:
         sample_rate = None
         all_wavs = []
+        chunk_dir = CHUNK_DIR / job_id
+        if COMBINE_ON_VPS:
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+
         for i, chunk in enumerate(chunks):
             # Only prepend style instruction to FIRST chunk.
             # Subsequent chunks continue naturally without re-instructing,
@@ -207,6 +233,10 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
 
+            # Save chunk to disk immediately (VPS combining mode)
+            if COMBINE_ON_VPS:
+                sf.write(str(chunk_dir / f"chunk_{i:04d}.wav"), wav, sample_rate)
+
             import torch
             torch.cuda.empty_cache()
 
@@ -214,25 +244,37 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 if job_id in _jobs:
                     _jobs[job_id]["progress"] = {"done": i + 1, "total": len(chunks)}
 
-        # All chunks generated — signal frontend that GPU can be stopped now
+        # All chunks generated
         with _jobs_lock:
             if job_id in _jobs:
                 _jobs[job_id]["status"] = "combining"
 
-        # Concatenate all chunks with silence gaps
-        silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
-        combined = all_wavs[0]
-        for wav in all_wavs[1:]:
-            combined = np.concatenate([combined, silence, wav])
+        if COMBINE_ON_VPS:
+            # Signal VPS to take over; include metadata it needs to combine
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["status"] = "chunks_ready"
+                    _jobs[job_id]["chunk_count"] = len(chunks)
+                    _jobs[job_id]["sample_rate"] = sample_rate
 
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = OUTPUT_DIR / f"clone-{timestamp}.wav"
-        sf.write(str(out_path), combined, sample_rate)
+            # Wait up to 90 s for VPS to fetch chunks, then fallback to RunPod combining
+            for _ in range(90):
+                time.sleep(1)
+                with _jobs_lock:
+                    fetched = _jobs.get(job_id, {}).get("chunks_fetched", False)
+                if fetched:
+                    print(f"[VPS combine] Chunks fetched by VPS for job {job_id}")
+                    break
+            else:
+                print(f"[VPS combine] Timeout — falling back to RunPod combining for job {job_id}")
+                _do_combine(job_id, all_wavs, sample_rate)
 
-        with _jobs_lock:
-            if job_id in _jobs:
-                _jobs[job_id]["status"] = "done"
-                _jobs[job_id]["result_path"] = str(out_path)
+            # Cleanup chunk files
+            shutil.rmtree(str(chunk_dir), ignore_errors=True)
+        else:
+            # Old behaviour: combine on RunPod
+            _do_combine(job_id, all_wavs, sample_rate)
+
     except Exception as e:
         with _jobs_lock:
             if job_id in _jobs:
@@ -331,6 +373,9 @@ async def get_status(job_id: str):
         "status": job["status"],
         "progress": job["progress"],
         "error": job.get("error"),
+        # Included when status=chunks_ready so VPS knows how many to fetch
+        "chunk_count": job.get("chunk_count"),
+        "sample_rate": job.get("sample_rate"),
     }
 
 
@@ -363,6 +408,24 @@ async def get_result(job_id: str):
         media_type="audio/wav",
         filename=f"voice-clone-{job_id}.wav",
     )
+
+
+@app.get("/chunk/{job_id}/{index}")
+async def get_chunk(job_id: str, index: int):
+    """Serve an individual chunk WAV for VPS-side combining."""
+    chunk_path = CHUNK_DIR / job_id / f"chunk_{index:04d}.wav"
+    if not chunk_path.exists():
+        raise HTTPException(status_code=404, detail=f"Chunk {index} not found for job {job_id}")
+    return FileResponse(str(chunk_path), media_type="audio/wav")
+
+
+@app.post("/chunks-fetched/{job_id}")
+async def mark_chunks_fetched(job_id: str):
+    """VPS calls this after downloading all chunks — releases the waiting thread."""
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["chunks_fetched"] = True
+    return {"ok": True}
 
 
 @app.post("/tts")
