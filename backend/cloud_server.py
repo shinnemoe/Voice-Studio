@@ -214,6 +214,11 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 if job_id in _jobs:
                     _jobs[job_id]["progress"] = {"done": i + 1, "total": len(chunks)}
 
+        # All chunks generated — signal frontend that GPU can be stopped now
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "combining"
+
         # Concatenate all chunks with silence gaps
         silence = np.zeros(int(SILENCE_GAP * sample_rate), dtype=np.float32)
         combined = all_wavs[0]
