@@ -205,7 +205,8 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
 
 
 def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
-                    quality_params: dict, temp_files: list[str]):
+                    quality_params: dict, temp_files: list[str],
+                    prompt_text: str = "", seed: int = 42):
     """Background generation worker — runs in a daemon thread."""
     try:
         sample_rate = None
@@ -215,20 +216,38 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
             chunk_dir.mkdir(parents=True, exist_ok=True)
 
         for i, chunk in enumerate(chunks):
-            # Only prepend style instruction to FIRST chunk.
-            # Subsequent chunks continue naturally without re-instructing,
-            # which prevents garbled/nonsense audio from repeated instructions.
-            if i == 0 and style_desc:
-                formatted = f"({style_desc}){chunk}"
+            # Seed torch and numpy for deterministic, consistent generation
+            if seed is not None and seed >= 0:
+                import torch
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed_all(seed)
+                np.random.seed(seed)
+
+            # Apply style instruction consistently across all chunks
+            if style_desc:
+                formatted = f"({style_desc}) {chunk}"
             else:
                 formatted = chunk
 
-            wav = _model.generate(
-                text=formatted,
-                reference_wav_path=ref_path,
-                retry_badcase=False,
-                **quality_params,
-            )
+            # Ultimate Cloning Mode: if prompt_text is provided, pass both prompt & reference
+            gen_params = dict(quality_params)
+            if prompt_text and prompt_text.strip():
+                wav = _model.generate(
+                    text=formatted,
+                    prompt_wav_path=ref_path,
+                    prompt_text=prompt_text.strip(),
+                    reference_wav_path=ref_path,
+                    retry_badcase=False,
+                    **gen_params,
+                )
+            else:
+                wav = _model.generate(
+                    text=formatted,
+                    reference_wav_path=ref_path,
+                    retry_badcase=False,
+                    **gen_params,
+                )
+
             all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
@@ -308,6 +327,8 @@ async def generate_cloned_voice(
     style: str = Form("Natural"),
     custom_style: str = Form(""),
     speed: str = Form("Normal"),
+    prompt_text: str = Form(""),
+    seed: int = Form(42),
 ):
     if _status != "ready":
         raise HTTPException(status_code=503, detail=f"Model not ready. Status: {_status}")
@@ -317,7 +338,6 @@ async def generate_cloned_voice(
     style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
-    # Speed text instruction — will be prepended to first chunk only
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
@@ -350,7 +370,7 @@ async def generate_cloned_voice(
 
         threading.Thread(
             target=_run_generation,
-            args=(job_id, chunks, ref_path, style_desc, quality_params, temp_files),
+            args=(job_id, chunks, ref_path, style_desc, quality_params, temp_files, prompt_text, seed),
             daemon=True,
         ).start()
 
