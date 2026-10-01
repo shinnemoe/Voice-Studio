@@ -153,7 +153,27 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
             for i in range(0, len(chunk), max_chars):
                 final3.append(chunk[i:i + max_chars].strip())
 
-    return [c for c in final3 if c]
+    chunks_raw = [c for c in final3 if c]
+
+    # Balance chunks: merge solitary short fragments (< 60 chars) into adjacent chunks if under max_chars
+    min_chars = 60
+    balanced = []
+    buf = ""
+    for c in chunks_raw:
+        if not buf:
+            buf = c
+        elif len(buf) < min_chars and (len(buf) + len(c) + 1) <= max_chars:
+            buf = f"{buf} {c}".strip()
+        else:
+            balanced.append(buf)
+            buf = c
+    if buf:
+        if len(buf) < min_chars and balanced and (len(balanced[-1]) + len(buf) + 1) <= max_chars:
+            balanced[-1] = f"{balanced[-1]} {buf}".strip()
+        else:
+            balanced.append(buf)
+
+    return balanced
 
 
 def _bootstrap_model():
@@ -206,7 +226,8 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
 
 def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
                     quality_params: dict, temp_files: list[str],
-                    prompt_text: str = "", seed: int = 42):
+                    prompt_text: str = "", seed: int = 42,
+                    context_chaining: bool = True):
     """Background generation worker — runs in a daemon thread."""
     try:
         sample_rate = None
@@ -215,42 +236,77 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
         if COMBINE_ON_VPS:
             chunk_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, chunk in enumerate(chunks):
-            # Seed torch and numpy for deterministic, consistent generation
-            if seed is not None and seed >= 0:
-                import torch
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-                np.random.seed(seed)
+        # Seed once at the start of the job for deterministic reproducibility
+        if seed is not None and seed >= 0:
+            import random
+            import torch
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed % (2**32 - 1))
+            random.seed(seed)
 
-            # Apply style instruction consistently across all chunks
-            if style_desc:
-                formatted = f"({style_desc}) {chunk}"
+        prev_wav = None
+        prev_text = None
+        prev_tmp = None
+
+        for i, chunk in enumerate(chunks):
+            # Apply style instruction consistently if specified
+            if style_desc and style_desc.strip():
+                formatted = f"({style_desc.strip()}) {chunk}"
             else:
                 formatted = chunk
 
-            # Ultimate Cloning Mode: if prompt_text is provided, pass both prompt & reference
             gen_params = dict(quality_params)
-            if prompt_text and prompt_text.strip():
-                wav = _model.generate(
-                    text=formatted,
-                    prompt_wav_path=ref_path,
-                    prompt_text=prompt_text.strip(),
-                    reference_wav_path=ref_path,
-                    retry_badcase=False,
-                    **gen_params,
-                )
-            else:
-                wav = _model.generate(
-                    text=formatted,
-                    reference_wav_path=ref_path,
-                    retry_badcase=False,
-                    **gen_params,
-                )
+            wav = None
+
+            # 1. Rolling Audio Continuation: Use previous chunk's audio & text as continuation prompt
+            if context_chaining and i > 0 and prev_wav is not None and prev_text:
+                try:
+                    if prev_tmp and Path(prev_tmp).exists():
+                        Path(prev_tmp).unlink(missing_ok=True)
+
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_prompt:
+                        prev_tmp = f_prompt.name
+                        temp_files.append(prev_tmp)
+                        sf.write(prev_tmp, prev_wav, sample_rate)
+
+                    wav = _model.generate(
+                        text=formatted,
+                        prompt_wav_path=prev_tmp,
+                        prompt_text=prev_text,
+                        reference_wav_path=ref_path,
+                        retry_badcase=False,
+                        **gen_params,
+                    )
+                except Exception as ex:
+                    print(f"[Voice Studio] Continuation on chunk {i} failed: {ex}. Falling back to reference mode.")
+                    wav = None
+
+            # 2. First chunk (with optional user prompt_text) or fallback
+            if wav is None:
+                if i == 0 and prompt_text and prompt_text.strip():
+                    wav = _model.generate(
+                        text=formatted,
+                        prompt_wav_path=ref_path,
+                        prompt_text=prompt_text.strip(),
+                        reference_wav_path=ref_path,
+                        retry_badcase=False,
+                        **gen_params,
+                    )
+                else:
+                    wav = _model.generate(
+                        text=formatted,
+                        reference_wav_path=ref_path,
+                        retry_badcase=False,
+                        **gen_params,
+                    )
 
             all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
+
+            prev_wav = wav
+            prev_text = chunk
 
             # Save chunk to disk immediately (VPS combining mode)
             if COMBINE_ON_VPS:
@@ -329,6 +385,7 @@ async def generate_cloned_voice(
     speed: str = Form("Normal"),
     prompt_text: str = Form(""),
     seed: int = Form(42),
+    context_chaining: bool = Form(True),
 ):
     if _status != "ready":
         raise HTTPException(status_code=503, detail=f"Model not ready. Status: {_status}")
@@ -370,7 +427,7 @@ async def generate_cloned_voice(
 
         threading.Thread(
             target=_run_generation,
-            args=(job_id, chunks, ref_path, style_desc, quality_params, temp_files, prompt_text, seed),
+            args=(job_id, chunks, ref_path, style_desc, quality_params, temp_files, prompt_text, seed, context_chaining),
             daemon=True,
         ).start()
 
