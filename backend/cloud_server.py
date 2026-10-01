@@ -224,6 +224,44 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
             _jobs[job_id]["result_path"] = str(out_path)
 
 
+def _format_chunk_for_tts(chunk: str, style_desc: str = "", is_last: bool = False) -> str:
+    """Format chunk text with style instructions, punctuation safeguards, and trailing cushions."""
+    c = chunk.strip()
+    # Ensure chunk ends with appropriate sentence terminator if missing
+    if c and not re.search(r"[။၊.!?…]$", c):
+        c += "။"
+
+    # Trailing cushion: Add spacing to give the autoregressive stop head margin to complete the final syllable
+    c = f"{c} "
+    if is_last:
+        c = f"{c} "
+
+    if style_desc and style_desc.strip():
+        return f"({style_desc.strip()}) {c}"
+    return c
+
+
+def _apply_chunk_audio_enhancements(wav: np.ndarray, sample_rate: int, is_last: bool = False) -> np.ndarray:
+    """Apply a smooth 25ms cosine fade-out and optional trailing room silence to the final chunk."""
+    if wav is None or len(wav) == 0:
+        return wav
+
+    # 25ms micro fade-out to prevent abrupt DC clicks / mid-syllable square cutoff
+    fade_len = int(sample_rate * 0.025)
+    if len(wav) > fade_len * 2 and fade_len > 0:
+        fade_curve = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, fade_len)))
+        wav = wav.copy()
+        wav[-fade_len:] *= fade_curve.astype(wav.dtype)
+
+    # On the very last chunk of the script, add 0.4s of clean room tone/silence so the final word
+    # decays naturally and browser/audio DACs never chop the ending during playback
+    if is_last:
+        tail_silence = np.zeros(int(0.4 * sample_rate), dtype=wav.dtype)
+        wav = np.concatenate([wav, tail_silence])
+
+    return wav
+
+
 def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
                     quality_params: dict, temp_files: list[str],
                     prompt_text: str = "", seed: int = 42,
@@ -246,11 +284,8 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
             random.seed(seed)
 
         for i, chunk in enumerate(chunks):
-            # Only apply style instruction if explicitly specified
-            if style_desc and style_desc.strip():
-                formatted = f"({style_desc.strip()}) {chunk}"
-            else:
-                formatted = chunk
+            is_last = (i == len(chunks) - 1)
+            formatted = _format_chunk_for_tts(chunk, style_desc, is_last=is_last)
 
             gen_params = dict(quality_params)
 
@@ -262,7 +297,7 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                     prompt_wav_path=ref_path,
                     prompt_text=prompt_text.strip(),
                     reference_wav_path=ref_path,
-                    retry_badcase=False,
+                    retry_badcase=True,
                     **gen_params,
                 )
             else:
@@ -270,24 +305,15 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 wav = _model.generate(
                     text=formatted,
                     reference_wav_path=ref_path,
-                    retry_badcase=False,
+                    retry_badcase=True,
                     **gen_params,
                 )
 
-            all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
 
-            # Save chunk to disk immediately (VPS combining mode)
-            if COMBINE_ON_VPS:
-                sf.write(str(chunk_dir / f"chunk_{i:04d}.wav"), wav, sample_rate)
-
-            import torch
-            torch.cuda.empty_cache()
-
-            with _jobs_lock:
-                if job_id in _jobs:
-                    _jobs[job_id]["progress"] = {"done": i + 1, "total": len(chunks)}
+            wav = _apply_chunk_audio_enhancements(wav, sample_rate, is_last=is_last)
+            all_wavs.append(wav)
 
             # Save chunk to disk immediately (VPS combining mode)
             if COMBINE_ON_VPS:
@@ -516,7 +542,7 @@ async def text_to_speech(
 
     formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
     try:
-        wav = _model.generate(text=formatted_text, retry_badcase=False, **quality_params)
+        wav = _model.generate(text=formatted_text, retry_badcase=True, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_path = OUTPUT_DIR / f"tts-{timestamp}.wav"
         sf.write(str(out_path), wav, _model.tts_model.sample_rate)
