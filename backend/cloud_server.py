@@ -227,7 +227,7 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
 def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: str,
                     quality_params: dict, temp_files: list[str],
                     prompt_text: str = "", seed: int = 42,
-                    context_chaining: bool = True):
+                    context_chaining: bool = False):
     """Background generation worker — runs in a daemon thread."""
     try:
         sample_rate = None
@@ -245,68 +245,49 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
             np.random.seed(seed % (2**32 - 1))
             random.seed(seed)
 
-        prev_wav = None
-        prev_text = None
-        prev_tmp = None
-
         for i, chunk in enumerate(chunks):
-            # Apply style instruction consistently if specified
+            # Only apply style instruction if explicitly specified
             if style_desc and style_desc.strip():
                 formatted = f"({style_desc.strip()}) {chunk}"
             else:
                 formatted = chunk
 
             gen_params = dict(quality_params)
-            wav = None
 
-            # 1. Rolling Audio Continuation: Use previous chunk's audio & text as continuation prompt
-            if context_chaining and i > 0 and prev_wav is not None and prev_text:
-                try:
-                    if prev_tmp and Path(prev_tmp).exists():
-                        Path(prev_tmp).unlink(missing_ok=True)
-
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_prompt:
-                        prev_tmp = f_prompt.name
-                        temp_files.append(prev_tmp)
-                        sf.write(prev_tmp, prev_wav, sample_rate)
-
-                    wav = _model.generate(
-                        text=formatted,
-                        prompt_wav_path=prev_tmp,
-                        prompt_text=prev_text,
-                        reference_wav_path=ref_path,
-                        retry_badcase=False,
-                        **gen_params,
-                    )
-                except Exception as ex:
-                    print(f"[Voice Studio] Continuation on chunk {i} failed: {ex}. Falling back to reference mode.")
-                    wav = None
-
-            # 2. First chunk (with optional user prompt_text) or fallback
-            if wav is None:
-                if i == 0 and prompt_text and prompt_text.strip():
-                    wav = _model.generate(
-                        text=formatted,
-                        prompt_wav_path=ref_path,
-                        prompt_text=prompt_text.strip(),
-                        reference_wav_path=ref_path,
-                        retry_badcase=False,
-                        **gen_params,
-                    )
-                else:
-                    wav = _model.generate(
-                        text=formatted,
-                        reference_wav_path=ref_path,
-                        retry_badcase=False,
-                        **gen_params,
-                    )
+            # Anchor directly to the human reference audio for 100% natural timbre without compounding degradation
+            if prompt_text and prompt_text.strip():
+                # Ultimate Cloning: uses clean human reference audio + transcript across all chunks
+                wav = _model.generate(
+                    text=formatted,
+                    prompt_wav_path=ref_path,
+                    prompt_text=prompt_text.strip(),
+                    reference_wav_path=ref_path,
+                    retry_badcase=False,
+                    **gen_params,
+                )
+            else:
+                # Standard Voice Cloning: pristine human reference conditioning on every chunk
+                wav = _model.generate(
+                    text=formatted,
+                    reference_wav_path=ref_path,
+                    retry_badcase=False,
+                    **gen_params,
+                )
 
             all_wavs.append(wav)
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
 
-            prev_wav = wav
-            prev_text = chunk
+            # Save chunk to disk immediately (VPS combining mode)
+            if COMBINE_ON_VPS:
+                sf.write(str(chunk_dir / f"chunk_{i:04d}.wav"), wav, sample_rate)
+
+            import torch
+            torch.cuda.empty_cache()
+
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["progress"] = {"done": i + 1, "total": len(chunks)}
 
             # Save chunk to disk immediately (VPS combining mode)
             if COMBINE_ON_VPS:
@@ -392,12 +373,21 @@ async def generate_cloned_voice(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
 
-    style_desc = custom_style.strip() or STYLE_PRESETS.get(style, STYLE_PRESETS["Natural"])
+    # Style instruction: NEVER default to prepending English instructions to Burmese text
+    if custom_style.strip():
+        style_desc = custom_style.strip()
+    elif style and style not in ("Natural", "Pure", "pure_clone"):
+        style_desc = STYLE_PRESETS.get(style, "")
+    else:
+        style_desc = ""
+
     quality_params = dict(QUALITY_PRESETS.get(quality, QUALITY_PRESETS["Balanced"]))
 
     speed_instruction = SPEED_INSTRUCTIONS.get(speed, "")
-    if speed_instruction:
-        style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
+    if speed_instruction and style_desc:
+        style_desc = f"{speed_instruction}, {style_desc}"
+    elif speed_instruction:
+        style_desc = speed_instruction
 
     suffix = Path(reference_audio.filename or "ref.wav").suffix or ".wav"
     ref_tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
