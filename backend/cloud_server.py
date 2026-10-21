@@ -49,10 +49,14 @@ QUALITY_PRESETS = {
 
 STYLE_PRESETS = {
     "Natural": "natural spoken delivery, clear and grounded",
-    "Deep Reflective": "deep reflective delivery, calm, philosophical, deliberate, intimate",
-    "Warm Storyteller": "warm storyteller delivery, grounded, expressive, gentle pauses",
-    "Soft Intimate": "soft intimate delivery, tender, close, quiet, slow",
-    "Documentary": "documentary narration delivery, deep, composed, serious tone",
+    "pure_clone": "",
+    "audiobook": "audiobook narration, steady and calm tone, consistent pacing and tempo throughout, clear articulation",
+    "documentary": "documentary narration delivery, deep, composed, serious tone",
+    "storyteller": "warm storyteller delivery, grounded, expressive, gentle pauses",
+    "news": "news anchor, crisp articulation, professional authoritative tone, steady rhythmic delivery",
+    "calm": "slow and steady pacing, relaxed calm tone, unhurried cadence",
+    "conversational": "conversational tone, friendly and warm, clear pronunciation, natural steady cadence",
+    "dramatic": "deep narrative voice, measured tempo, serious and steady delivery",
 }
 
 SPEED_INSTRUCTIONS: dict[str, str] = {
@@ -102,78 +106,98 @@ def _trim_audio(path, max_duration=MAX_REF_DURATION):
 
 
 def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
-    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars."""
-    def _split_and_merge(parts: list[str], delimiter: str, max_len: int) -> list[str]:
-        result = []
-        buf = ""
-        for part in parts:
-            candidate = (buf + delimiter + part).strip() if buf else part
-            if len(candidate) <= max_len:
-                buf = candidate
-            else:
-                if buf:
-                    result.append(buf)
-                if len(part) > max_len:
-                    result.append(part)
+    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars without repetition."""
+    text = text.strip()
+    if not text:
+        return []
+
+    # 1. Normalize line endings
+    text = re.sub(r"\r\n|\r", "\n", text)
+
+    # 2. Split on sentence boundaries: Burmese '။', English '.', '!', '?', newlines '\n'
+    # Use capturing group to keep delimiters attached
+    tokens = re.split(r"([။.!?\n]+)", text)
+    raw_sentences = []
+    for i in range(0, len(tokens), 2):
+        chunk_text = tokens[i]
+        delim = tokens[i + 1] if i + 1 < len(tokens) else ""
+        s = (chunk_text + delim).strip()
+        if s:
+            raw_sentences.append(s)
+
+    # 3. For any sentence longer than max_chars, split on clause boundaries
+    atomic_parts = []
+    for s in raw_sentences:
+        if len(s) <= max_chars:
+            atomic_parts.append(s)
+        else:
+            # Split by Burmese comma '၊' or English comma ',', ';'
+            clause_tokens = re.split(r"([၊,;]+)", s)
+            clause_parts = []
+            for j in range(0, len(clause_tokens), 2):
+                ct = clause_tokens[j]
+                cd = clause_tokens[j + 1] if j + 1 < len(clause_tokens) else ""
+                part = (ct + cd).strip()
+                if part:
+                    clause_parts.append(part)
+
+            for cp in clause_parts:
+                if len(cp) <= max_chars:
+                    atomic_parts.append(cp)
                 else:
-                    buf = part
-        if buf:
-            result.append(buf)
-        return result
+                    # Split by whitespace
+                    words = cp.split()
+                    if len(words) > 1:
+                        w_buf = ""
+                        for w in words:
+                            cand = f"{w_buf} {w}".strip() if w_buf else w
+                            if len(cand) <= max_chars:
+                                w_buf = cand
+                            else:
+                                if w_buf:
+                                    atomic_parts.append(w_buf)
+                                w_buf = w
+                        if w_buf:
+                            atomic_parts.append(w_buf)
+                    else:
+                        # Fallback for continuous unbroken string: break cleanly at safe character boundaries
+                        rem = cp
+                        while len(rem) > max_chars:
+                            split_idx = -1
+                            # Look backwards from max_chars down to 60% for a base consonant / whitespace
+                            for k in range(max_chars, int(max_chars * 0.6), -1):
+                                ch = rem[k]
+                                prev_ch = rem[k - 1]
+                                # Check if safe break: base Burmese consonant NOT preceded by virama (1039)
+                                is_burmese_base = ('\u1000' <= ch <= '\u1021' or '\u1023' <= ch <= '\u102a') and prev_ch != '\u1039'
+                                is_ascii_break = ch.isspace() or prev_ch.isspace()
+                                if is_burmese_base or is_ascii_break:
+                                    split_idx = k
+                                    break
+                            if split_idx == -1:
+                                split_idx = max_chars
+                            atomic_parts.append(rem[:split_idx].strip())
+                            rem = rem[split_idx:].strip()
+                        if rem:
+                            atomic_parts.append(rem)
 
-    step1 = re.split(r"(?<=[။.!?])\s*", text)
-    step1 = [s.strip() for s in step1 if s.strip()]
-    chunks = _split_and_merge(step1, " ", max_chars)
-
-    final = []
-    for chunk in chunks:
-        if len(chunk) <= max_chars:
-            final.append(chunk)
-        else:
-            sub_parts = re.split(r"(?<=[၊])\s*", chunk)
-            sub_parts = [s.strip() for s in sub_parts if s.strip()]
-            sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
-            final.extend(sub_chunks)
-
-    final2 = []
-    for chunk in final:
-        if len(chunk) <= max_chars:
-            final2.append(chunk)
-        else:
-            sub_parts = re.split(r"(?<=[,])\s*", chunk)
-            sub_parts = [s.strip() for s in sub_parts if s.strip()]
-            sub_chunks = _split_and_merge(sub_parts, " ", max_chars)
-            final2.extend(sub_chunks)
-
-    final3 = []
-    for chunk in final2:
-        if len(chunk) <= max_chars:
-            final3.append(chunk)
-        else:
-            for i in range(0, len(chunk), max_chars):
-                final3.append(chunk[i:i + max_chars].strip())
-
-    chunks_raw = [c for c in final3 if c]
-
-    # Balance chunks: merge solitary short fragments (< 60 chars) into adjacent chunks if under max_chars
-    min_chars = 60
-    balanced = []
+    # 4. Sequentially merge atomic parts into optimal chunks <= max_chars
+    chunks = []
     buf = ""
-    for c in chunks_raw:
+    for p in atomic_parts:
         if not buf:
-            buf = c
-        elif len(buf) < min_chars and (len(buf) + len(c) + 1) <= max_chars:
-            buf = f"{buf} {c}".strip()
+            buf = p
         else:
-            balanced.append(buf)
-            buf = c
+            cand = f"{buf} {p}".strip()
+            if len(cand) <= max_chars:
+                buf = cand
+            else:
+                chunks.append(buf)
+                buf = p
     if buf:
-        if len(buf) < min_chars and balanced and (len(balanced[-1]) + len(buf) + 1) <= max_chars:
-            balanced[-1] = f"{balanced[-1]} {buf}".strip()
-        else:
-            balanced.append(buf)
+        chunks.append(buf)
 
-    return balanced
+    return chunks
 
 
 def _bootstrap_model():
@@ -227,16 +251,20 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
 def _format_chunk_for_tts(chunk: str, style_desc: str = "", is_last: bool = False) -> str:
     """Format chunk text with style instructions, punctuation safeguards, and trailing cushions."""
     c = chunk.strip()
+    is_burmese = any('\u1000' <= ch <= '\u109f' for ch in c)
+
     # Ensure chunk ends with appropriate sentence terminator if missing
     if c and not re.search(r"[။၊.!?…]$", c):
-        c += "။"
+        c += "။" if is_burmese else "."
 
     # Trailing cushion: Add spacing to give the autoregressive stop head margin to complete the final syllable
     c = f"{c} "
     if is_last:
         c = f"{c} "
 
-    if style_desc and style_desc.strip():
+    # For Burmese text, never prepend English style instructions (e.g. "audiobook narration...")
+    # Multilingual models like VoxCPM will read English text in parentheses aloud before the Burmese sentence!
+    if style_desc and style_desc.strip() and not is_burmese:
         return f"({style_desc.strip()}) {c}"
     return c
 
@@ -274,20 +302,22 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
         if COMBINE_ON_VPS:
             chunk_dir.mkdir(parents=True, exist_ok=True)
 
-        # Seed once at the start of the job for deterministic reproducibility
-        if seed is not None and seed >= 0:
-            import random
-            import torch
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            np.random.seed(seed % (2**32 - 1))
-            random.seed(seed)
-
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             formatted = _format_chunk_for_tts(chunk, style_desc, is_last=is_last)
 
             gen_params = dict(quality_params)
+
+            # Deterministic, consistent generation:
+            # Seed torch and numpy before EACH chunk so that speaker pitch and onset timbre
+            # remain consistent across chunks without random drift
+            if seed is not None and seed >= 0:
+                import random
+                import torch
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed_all(seed)
+                np.random.seed(seed % (2**32 - 1))
+                random.seed(seed)
 
             # Anchor directly to the human reference audio for 100% natural timbre without compounding degradation
             if prompt_text and prompt_text.strip():
@@ -297,7 +327,7 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                     prompt_wav_path=ref_path,
                     prompt_text=prompt_text.strip(),
                     reference_wav_path=ref_path,
-                    retry_badcase=True,
+                    retry_badcase=False,
                     **gen_params,
                 )
             else:
@@ -305,7 +335,7 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 wav = _model.generate(
                     text=formatted,
                     reference_wav_path=ref_path,
-                    retry_badcase=True,
+                    retry_badcase=False,
                     **gen_params,
                 )
 
@@ -540,9 +570,10 @@ async def text_to_speech(
     if speed_instruction:
         style_desc = f"{speed_instruction}, {style_desc}" if style_desc else speed_instruction
 
-    formatted_text = f"({style_desc}){text.strip()}" if style_desc else text.strip()
+    is_burmese = any('\u1000' <= ch <= '\u109f' for ch in text)
+    formatted_text = f"({style_desc}){text.strip()}" if (style_desc and not is_burmese) else text.strip()
     try:
-        wav = _model.generate(text=formatted_text, retry_badcase=True, **quality_params)
+        wav = _model.generate(text=formatted_text, retry_badcase=False, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_path = OUTPUT_DIR / f"tts-{timestamp}.wav"
         sf.write(str(out_path), wav, _model.tts_model.sample_rate)
