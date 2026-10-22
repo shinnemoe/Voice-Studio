@@ -21,6 +21,26 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
+# ── Brotli / httpx compatibility patch ──────────────────────────────────────────
+# httpx / httpx2 incorrectly pass output_buffer_limit keyword argument to brotli.Decompressor.process(),
+# which throws "TypeError: process() takes no keyword arguments" when Google's brotli C-extension is used.
+def _patch_brotli():
+    for pkg in ("httpx", "httpx2"):
+        try:
+            mod = __import__(f"{pkg}._decoders", fromlist=["BrotliDecoder"])
+            orig_init = mod.BrotliDecoder.__init__
+            def make_init(orig):
+                def new_init(self, *a, **k):
+                    orig(self, *a, **k)
+                    fn = self._decompress
+                    self._decompress = lambda data, *args, **kwargs: fn(data)
+                return new_init
+            mod.BrotliDecoder.__init__ = make_init(orig_init)
+        except Exception:
+            pass
+
+_patch_brotli()
+
 ROOT = Path(__file__).resolve().parent.parent
 VOXCPM_DIR = ROOT / "VoxCPM"
 SRC_DIR = VOXCPM_DIR / "src"
@@ -213,6 +233,8 @@ def _bootstrap_model():
             snapshot_download("openbmb/VoxCPM2", local_dir=str(model_dir))
             print(f"[Voice Studio] Download complete! Saved to {model_dir}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             _status = "error"
             _status_detail = f"Download failed: {e}"
             print(f"[Voice Studio] {_status_detail}")
@@ -228,6 +250,8 @@ def _bootstrap_model():
         _status_detail = "Model loaded and ready!"
         print(f"[Voice Studio] {_status_detail}")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         _status = "error"
         _status_detail = f"Model load failed: {e}"
         print(f"[Voice Studio] {_status_detail}")
