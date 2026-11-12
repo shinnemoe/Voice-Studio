@@ -273,7 +273,7 @@ def _do_combine(job_id: str, all_wavs: list, sample_rate: int):
 
 
 def _format_chunk_for_tts(chunk: str, style_desc: str = "", is_last: bool = False) -> str:
-    """Format chunk text with style instructions, punctuation safeguards, and trailing cushions."""
+    """Format chunk text with style instructions, punctuation safeguards, and clean termination."""
     c = chunk.strip()
     is_burmese = any('\u1000' <= ch <= '\u109f' for ch in c)
 
@@ -281,10 +281,12 @@ def _format_chunk_for_tts(chunk: str, style_desc: str = "", is_last: bool = Fals
     if c and not re.search(r"[။၊.!?…]$", c):
         c += "။" if is_burmese else "."
 
-    # Trailing cushion: Add spacing to give the autoregressive stop head margin to complete the final syllable
-    c = f"{c} "
-    if is_last:
-        c = f"{c} "
+    # Burmese punctuation normalization: if it ends in English period or comma, normalize to Burmese terminator
+    if is_burmese:
+        c = re.sub(r"[.၊,…]+\s*$", "။", c)
+
+    # Clean stripped text — do NOT add trailing space cushions which cause autoregressive hallucination
+    c = c.strip()
 
     # For Burmese text, never prepend English style instructions (e.g. "audiobook narration...")
     # Multilingual models like VoxCPM will read English text in parentheses aloud before the Burmese sentence!
@@ -351,7 +353,7 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                     prompt_wav_path=ref_path,
                     prompt_text=prompt_text.strip(),
                     reference_wav_path=ref_path,
-                    retry_badcase=False,
+                    retry_badcase=True,
                     **gen_params,
                 )
             else:
@@ -359,7 +361,7 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 wav = _model.generate(
                     text=formatted,
                     reference_wav_path=ref_path,
-                    retry_badcase=False,
+                    retry_badcase=True,
                     **gen_params,
                 )
 
@@ -597,7 +599,7 @@ async def text_to_speech(
     is_burmese = any('\u1000' <= ch <= '\u109f' for ch in text)
     formatted_text = f"({style_desc}){text.strip()}" if (style_desc and not is_burmese) else text.strip()
     try:
-        wav = _model.generate(text=formatted_text, retry_badcase=False, **quality_params)
+        wav = _model.generate(text=formatted_text, retry_badcase=True, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_path = OUTPUT_DIR / f"tts-{timestamp}.wav"
         sf.write(str(out_path), wav, _model.tts_model.sample_rate)
