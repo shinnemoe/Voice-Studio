@@ -345,25 +345,13 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 np.random.seed(seed % (2**32 - 1))
                 random.seed(seed)
 
-            # Anchor directly to the human reference audio for 100% natural timbre without compounding degradation
-            if prompt_text and prompt_text.strip():
-                # Ultimate Cloning: uses clean human reference audio + transcript across all chunks
-                wav = _model.generate(
-                    text=formatted,
-                    prompt_wav_path=ref_path,
-                    prompt_text=prompt_text.strip(),
-                    reference_wav_path=ref_path,
-                    retry_badcase=True,
-                    **gen_params,
-                )
-            else:
-                # Standard Voice Cloning: pristine human reference conditioning on every chunk
-                wav = _model.generate(
-                    text=formatted,
-                    reference_wav_path=ref_path,
-                    retry_badcase=True,
-                    **gen_params,
-                )
+            # Pristine Voice Cloning: reference_wav_path isolates timbre without repeating reference words
+            wav = _model.generate(
+                text=formatted,
+                reference_wav_path=ref_path,
+                retry_badcase=True,
+                **gen_params,
+            )
 
             if sample_rate is None:
                 sample_rate = _model.tts_model.sample_rate
