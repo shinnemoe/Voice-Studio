@@ -126,10 +126,15 @@ def _trim_audio(path, max_duration=MAX_REF_DURATION):
 
 
 def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
-    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under max_chars without repetition."""
+    """Split text by sentence boundaries (Burmese-prioritized), keeping chunks under safe length without repetition."""
     text = text.strip()
     if not text:
         return []
+
+    # Check if text contains Burmese characters
+    is_burmese = any('\u1000' <= ch <= '\u109f' for ch in text)
+    # Burmese text requires shorter chunks (max 180 chars) to prevent attention drift & token runaway
+    effective_max_chars = min(max_chars, 180) if is_burmese else max_chars
 
     # 1. Normalize line endings
     text = re.sub(r"\r\n|\r", "\n", text)
@@ -145,10 +150,10 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
         if s:
             raw_sentences.append(s)
 
-    # 3. For any sentence longer than max_chars, split on clause boundaries
+    # 3. For any sentence longer than effective_max_chars, split on clause boundaries
     atomic_parts = []
     for s in raw_sentences:
-        if len(s) <= max_chars:
+        if len(s) <= effective_max_chars:
             atomic_parts.append(s)
         else:
             # Split by Burmese comma '၊' or English comma ',', ';'
@@ -162,7 +167,7 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
                     clause_parts.append(part)
 
             for cp in clause_parts:
-                if len(cp) <= max_chars:
+                if len(cp) <= effective_max_chars:
                     atomic_parts.append(cp)
                 else:
                     # Split by whitespace
@@ -171,7 +176,7 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
                         w_buf = ""
                         for w in words:
                             cand = f"{w_buf} {w}".strip() if w_buf else w
-                            if len(cand) <= max_chars:
+                            if len(cand) <= effective_max_chars:
                                 w_buf = cand
                             else:
                                 if w_buf:
@@ -182,26 +187,26 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
                     else:
                         # Fallback for continuous unbroken string: break cleanly at safe character boundaries
                         rem = cp
-                        while len(rem) > max_chars:
+                        while len(rem) > effective_max_chars:
                             split_idx = -1
-                            # Look backwards from max_chars down to 60% for a base consonant / whitespace
-                            for k in range(max_chars, int(max_chars * 0.6), -1):
+                            # Look backwards from effective_max_chars down to 50% for a base consonant / whitespace
+                            for k in range(effective_max_chars, int(effective_max_chars * 0.5), -1):
                                 ch = rem[k]
                                 prev_ch = rem[k - 1]
-                                # Check if safe break: base Burmese consonant NOT preceded by virama (1039)
-                                is_burmese_base = ('\u1000' <= ch <= '\u1021' or '\u1023' <= ch <= '\u102a') and prev_ch != '\u1039'
+                                # Safe break: base Burmese consonant NOT preceded by virama (1039) or asat (103A)
+                                is_burmese_base = ('\u1000' <= ch <= '\u1021' or '\u1023' <= ch <= '\u102a') and prev_ch not in ('\u1039', '\u103a')
                                 is_ascii_break = ch.isspace() or prev_ch.isspace()
                                 if is_burmese_base or is_ascii_break:
                                     split_idx = k
                                     break
                             if split_idx == -1:
-                                split_idx = max_chars
+                                split_idx = effective_max_chars
                             atomic_parts.append(rem[:split_idx].strip())
                             rem = rem[split_idx:].strip()
                         if rem:
                             atomic_parts.append(rem)
 
-    # 4. Sequentially merge atomic parts into optimal chunks <= max_chars
+    # 4. Sequentially merge atomic parts into optimal chunks <= effective_max_chars
     chunks = []
     buf = ""
     for p in atomic_parts:
@@ -209,7 +214,7 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
             buf = p
         else:
             cand = f"{buf} {p}".strip()
-            if len(cand) <= max_chars:
+            if len(cand) <= effective_max_chars:
                 buf = cand
             else:
                 chunks.append(buf)
@@ -217,11 +222,34 @@ def _split_sentences(text: str, max_chars: int = 300) -> list[str]:
     if buf:
         chunks.append(buf)
 
-    return chunks
+    # 5. Ensure every chunk strictly terminates with valid sentence punctuation
+    final_chunks = []
+    for c in chunks:
+        c = c.strip()
+        if not c:
+            continue
+        if is_burmese:
+            # Strip trailing commas, periods, or ellipsis, and ensure strictly ends with ။
+            c = re.sub(r"[.၊,…\s]+$", "", c).strip()
+            if not c.endswith("။"):
+                c += "။"
+        else:
+            if not re.search(r"[.!?]$", c):
+                c += "."
+        final_chunks.append(c)
+
+    return final_chunks
 
 
 def _bootstrap_model():
     global _model, _status, _status_detail
+    if _model is not None:
+        _status = "ready"
+        _status_detail = "Model loaded and ready!"
+        return
+    if _status in ("loading", "downloading"):
+        print("[Voice Studio] Model is already loading/downloading, skipping duplicate bootstrap.")
+        return
     model_dir = Path(MODEL_PATH)
     if not model_dir.exists() or not any(model_dir.iterdir()):
         _status = "downloading"
@@ -345,6 +373,11 @@ def _run_generation(job_id: str, chunks: list[str], ref_path: str, style_desc: s
                 np.random.seed(seed % (2**32 - 1))
                 random.seed(seed)
 
+            # Safe max_len guard: prevent autoregressive runaway loops and CUDA assertion out-of-bounds (tmp5 < 8192)
+            # 1 char of text roughly equals 1-2 frames; 3.5x provides generous margin, clamped to max 600 frames
+            chunk_max_len = min(max(int(len(formatted) * 3.5), 180), 600)
+            gen_params.setdefault("max_len", chunk_max_len)
+
             # Pristine Voice Cloning: reference_wav_path isolates timbre without repeating reference words
             wav = _model.generate(
                 text=formatted,
@@ -417,8 +450,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 async def startup_event():
-    threading.Thread(target=_bootstrap_model, daemon=True).start()
-    print("[Voice Studio] Server started. Poll /health for model status.")
+    if _model is None and _status not in ("loading", "ready"):
+        threading.Thread(target=_bootstrap_model, daemon=True).start()
+    print(f"[Voice Studio] Server startup event triggered. Model ready: {_model is not None}")
 
 
 @app.get("/health")
@@ -587,6 +621,8 @@ async def text_to_speech(
     is_burmese = any('\u1000' <= ch <= '\u109f' for ch in text)
     formatted_text = f"({style_desc}){text.strip()}" if (style_desc and not is_burmese) else text.strip()
     try:
+        chunk_max_len = min(max(int(len(formatted_text) * 3.5), 180), 600)
+        quality_params.setdefault("max_len", chunk_max_len)
         wav = _model.generate(text=formatted_text, retry_badcase=True, **quality_params)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_path = OUTPUT_DIR / f"tts-{timestamp}.wav"
